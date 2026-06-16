@@ -90,10 +90,10 @@ const pad = n => String(n).padStart(5, "0");
 const today = () => new Date().toISOString().slice(0, 10);
 
 const VEHICLES = [
-  { label: "Sedan / Bakkie", icon: "🚗", l: 8,  fuel: "p93" },
-  { label: "Minibus / LDV",  icon: "🚐", l: 12, fuel: "p93" },
-  { label: "1–3 Ton Truck",  icon: "🚚", l: 14, fuel: "d50" },
-  { label: "Semi / Artic",   icon: "🚛", l: 22, fuel: "d50" },
+  { label: "Sedan / Bakkie", l: 8,  fuel: "p93" },
+  { label: "Minibus / LDV",  l: 12, fuel: "p93" },
+  { label: "1–3 Ton Truck",  l: 14, fuel: "d50" },
+  { label: "Semi / Artic",   l: 22, fuel: "d50" },
 ];
 
 const FUEL_QUOTE_OPTS = [
@@ -760,7 +760,6 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
             <div className="v-grid" style={{marginBottom:14}}>
               {VEHICLES.map((v, i) => (
                 <button key={i} className={`v-btn ${veh===i?"active":""}`} onClick={() => { setVeh(i); setFuelKey(v.fuel === "d50" ? "d50i" : "p93i"); }}>
-                  <span className="v-icon">{v.icon}</span>
                   <span className="v-name">{v.label}</span>
                   <span className="v-stat">~{v.l}L/100km</span>
                 </button>
@@ -807,7 +806,7 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
             </div>
             <hr className="divider" />
             <div style={{fontSize:13}}>
-              {[["⛽ Fuel",R(fuelCost)],["👤 Driver",R(driverCost)],["🛣 Tolls",R(tolls)],["📦 Subtotal",R(subtotal)],[`✨ Margin (${margin}%)`,R(total-subtotal)]].map(([l,v])=>(
+              {[["Fuel",R(fuelCost)],["Driver",R(driverCost)],["Tolls",R(tolls)],["Subtotal",R(subtotal)],[`Margin (${margin}%)`,R(total-subtotal)]].map(([l,v])=>(
                 <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid var(--border)"}}>
                   <span style={{color:"var(--muted)"}}>{l}</span><span style={{fontWeight:600}}>{v}</span>
                 </div>
@@ -818,9 +817,9 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
             </div>
           </div>
 
-          <button className="btn btn-primary" style={{width:"100%",marginBottom:8,justifyContent:"center"}} onClick={handleSave}>💾 Save Quote</button>
-          <button className="btn btn-green" style={{width:"100%",marginBottom:8,justifyContent:"center"}} onClick={handleWhatsApp}>💬 Share on WhatsApp</button>
-          <button className="btn btn-ghost" style={{width:"100%",justifyContent:"center"}} onClick={() => setPreview(true)}>📄 Preview PDF Quote</button>
+          <button className="btn btn-primary" style={{width:"100%",marginBottom:8,justifyContent:"center"}} onClick={handleSave}>Save Quote</button>
+          <button className="btn btn-green" style={{width:"100%",marginBottom:8,justifyContent:"center"}} onClick={handleWhatsApp}>Share on WhatsApp</button>
+          <button className="btn btn-ghost" style={{width:"100%",justifyContent:"center"}} onClick={() => setPreview(true)}>Preview PDF Quote</button>
         </div>
       </div>
 
@@ -834,7 +833,7 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
             <QuotePDF q={{number:"00001",clientName:displayName,from,to,dist,vehicle:vehicle.label,
               fuelCost,driverCost,tolls,margin,total,subtotal,notes,createdAt:today()}} profile={profile} fuelMonth={fuel.month} />
             <div className="btn-row" style={{marginTop:16}}>
-              <button className="btn btn-green" style={{flex:1,justifyContent:"center"}} onClick={handleWhatsApp}>💬 Send via WhatsApp</button>
+              <button className="btn btn-green" style={{flex:1,justifyContent:"center"}} onClick={handleWhatsApp}>Send via WhatsApp</button>
             </div>
           </div>
         </div>
@@ -875,11 +874,11 @@ function QuotePDF({ q, profile, fuelMonth }) {
 
       <div className="qp-section">
         <h4>Cost Breakdown</h4>
-        <div className="qp-row"><span>⛽ Fuel Cost</span><span>{R(q.fuelCost)}</span></div>
-        <div className="qp-row"><span>👤 Driver Cost</span><span>{R(q.driverCost)}</span></div>
-        <div className="qp-row"><span>🛣 Tolls</span><span>{R(q.tolls)}</span></div>
-        <div className="qp-row"><span>📦 Subtotal</span><span>{R(q.subtotal)}</span></div>
-        <div className="qp-row"><span>✨ Margin ({q.margin}%)</span><span>{R(q.total - q.subtotal)}</span></div>
+        <div className="qp-row"><span>Fuel Cost</span><span>{R(q.fuelCost)}</span></div>
+        <div className="qp-row"><span>Driver Cost</span><span>{R(q.driverCost)}</span></div>
+        <div className="qp-row"><span>Tolls</span><span>{R(q.tolls)}</span></div>
+        <div className="qp-row"><span>Subtotal</span><span>{R(q.subtotal)}</span></div>
+        <div className="qp-row"><span>Margin ({q.margin}%)</span><span>{R(q.total - q.subtotal)}</span></div>
         <div className="qp-total"><span>TOTAL QUOTE</span><span>{R(q.total)}</span></div>
       </div>
 
@@ -938,7 +937,7 @@ function QuotesList({ quotes, clients, updateStatus, deleteQuote, profile, fuel,
                   <td>
                     <div style={{display:"flex",gap:6}}>
                       <button className="btn btn-ghost btn-sm" onClick={() => setSelected(q)}>View</button>
-                      <button className="btn btn-green btn-sm" onClick={() => handleWhatsApp(q)}>💬</button>
+                      <button className="btn btn-green btn-sm" onClick={() => handleWhatsApp(q)}>WhatsApp</button>
                       <button className="btn btn-red btn-sm" onClick={() => deleteQuote(q.id)}>✕</button>
                     </div>
                   </td>
@@ -958,7 +957,7 @@ function QuotesList({ quotes, clients, updateStatus, deleteQuote, profile, fuel,
             </div>
             <QuotePDF q={selected} profile={profile} fuelMonth={fuel.month} />
             <div className="btn-row" style={{marginTop:16}}>
-              <button className="btn btn-green" style={{flex:1,justifyContent:"center"}} onClick={() => handleWhatsApp(selected)}>💬 Send via WhatsApp</button>
+              <button className="btn btn-green" style={{flex:1,justifyContent:"center"}} onClick={() => handleWhatsApp(selected)}>Send via WhatsApp</button>
             </div>
           </div>
         </div>
