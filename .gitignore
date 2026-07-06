@@ -4,3 +4,6 @@ dist
 .env.*
 .vercel
 .DS_Store
+server/data/*.db
+server/data/*.db-*
+server/node_modules

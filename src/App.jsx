@@ -1,5 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { booleanPointInPolygon, distance, point } from "@turf/turf";
+import COASTAL_ZONE from "./data/coastal-zone.json";
+import { checkApiHealth, fetchBootstrap, saveProfileApi, saveClientsApi, saveQuotesApi } from "./api.js";
 
 const API_BASE = "https://sa-fuel-api.guerillagardeningkzn.workers.dev";
 
@@ -12,23 +15,24 @@ const TRACKER_PRODUCTS = [
   { id: "d500c", title: "Diesel 0.05%", region: "Coastal",     color: "#2BB87A", chart: "Diesel Coastal" },
 ];
 
-// Fleet-grade diesel (API only — for truck quotes, not on DMRE tracker dashboard)
+// Fleet 50ppm diesel — higher-sulphur pump grade many trucks use (API field: d50)
 const FLEET_DIESEL = [
-  { id: "d50i", label: "Diesel 50ppm · Inland (fleet)" },
-  { id: "d50c", label: "Diesel 50ppm · Coastal (fleet)" },
+  { id: "d50i", label: "Diesel 50ppm · Inland" },
+  { id: "d50c", label: "Diesel 50ppm · Coastal" },
 ];
 
 function fuelFromApiEntry(entry) {
-  const p = entry.prices;
+  const p = entry?.prices;
+  if (!p) return { ...FUEL, month: entry?.monthLabel || FUEL.month };
   return {
-    p95i:  p.petrol.p95Inland,
-    p95c:  p.petrol.p95Coastal,
-    p93i:  p.petrol.p93Inland,
-    d500i: p.diesel.d500Inland,
-    d500c: p.diesel.d500Coastal,
-    d50i:  p.diesel.d50Inland,
-    d50c:  p.diesel.d50Coastal,
-    month: entry.monthLabel,
+    p95i:  p.petrol?.p95Inland  ?? FUEL.p95i,
+    p95c:  p.petrol?.p95Coastal ?? FUEL.p95c,
+    p93i:  p.petrol?.p93Inland  ?? FUEL.p93i,
+    d500i: p.diesel?.d500Inland ?? FUEL.d500i,
+    d500c: p.diesel?.d500Coastal ?? FUEL.d500c,
+    d50i:  p.diesel?.d50Inland  ?? FUEL.d50i,
+    d50c:  p.diesel?.d50Coastal ?? FUEL.d50c,
+    month: entry.monthLabel || FUEL.month,
   };
 }
 
@@ -58,8 +62,8 @@ const HISTORY = [
 ];
 
 
-// ─── Persistent storage (localStorage — same keys as Claude artifact) ─────
-const store = {
+// ─── Persistent storage (API backend with localStorage fallback) ──────────
+const localStore = {
   async get(key) {
     try {
       const raw = localStorage.getItem(key);
@@ -75,6 +79,87 @@ const store = {
   },
 };
 
+let useBackend = false;
+
+async function initDataStore() {
+  useBackend = await checkApiHealth();
+  return useBackend;
+}
+
+async function loadAppData() {
+  if (useBackend) {
+    try {
+      const data = await fetchBootstrap();
+      const localClients = await localStore.get("lc_clients");
+      const localQuotes = await localStore.get("lc_quotes");
+      const localProfile = await localStore.get("lc_profile");
+      const hasLocal = (localClients?.length || localQuotes?.length || localProfile?.company);
+
+      if (hasLocal && !data.clients?.length && !data.quotes?.length) {
+        const clients = localClients || [];
+        const quotes = localQuotes || [];
+        const profile = localProfile || data.profile;
+        await saveClientsApi(clients);
+        await saveQuotesApi(quotes);
+        await saveProfileApi(profile);
+        return { clients, quotes, profile, migrated: true };
+      }
+
+      return { clients: data.clients || [], quotes: data.quotes || [], profile: data.profile, migrated: false };
+    } catch {
+      useBackend = false;
+    }
+  }
+
+  const [clients, quotes, profile] = await Promise.all([
+    localStore.get("lc_clients"),
+    localStore.get("lc_quotes"),
+    localStore.get("lc_profile"),
+  ]);
+  return {
+    clients: clients || [],
+    quotes: quotes || [],
+    profile: profile || { company: "My Transport Co", owner: "", phone: "", email: "", vat: "" },
+    migrated: false,
+  };
+}
+
+async function persistClients(clients) {
+  if (useBackend) {
+    try {
+      await saveClientsApi(clients);
+      return;
+    } catch {
+      useBackend = false;
+    }
+  }
+  await localStore.set("lc_clients", clients);
+}
+
+async function persistQuotes(quotes) {
+  if (useBackend) {
+    try {
+      await saveQuotesApi(quotes);
+      return;
+    } catch {
+      useBackend = false;
+    }
+  }
+  await localStore.set("lc_quotes", quotes);
+}
+
+async function persistProfile(profile) {
+  if (useBackend) {
+    try {
+      await saveProfileApi(profile);
+      return;
+    } catch {
+      useBackend = false;
+    }
+  }
+  await localStore.set("lc_profile", profile);
+}
+
 // ─── Live fuel prices (Jun 2026 DMRE fallback, refreshed from SA Fuel API) ─
 const FUEL = {
   p95i: 28.06, p95c: 27.19, p93i: 27.95,
@@ -84,22 +169,257 @@ const FUEL = {
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
-const R = n => "R" + Number(n).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+const R = n => {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "R0.00";
+  return "R" + v.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+};
 const uid = () => Math.random().toString(36).slice(2, 9).toUpperCase();
 const pad = n => String(n).padStart(5, "0");
 const today = () => new Date().toISOString().slice(0, 10);
 
 const VEHICLES = [
-  { label: "Sedan / Bakkie", l: 8,  fuel: "p93" },
-  { label: "Minibus / LDV",  l: 12, fuel: "p93" },
-  { label: "1–3 Ton Truck",  l: 14, fuel: "d50" },
-  { label: "Semi / Artic",   l: 22, fuel: "d50" },
+  { label: "Sedan / Bakkie", l: 8,  emptyL: 6,  fuel: "petrol" },
+  { label: "Minibus / LDV",  l: 12, emptyL: 9,  fuel: "petrol" },
+  { label: "1–3 Ton Truck",  l: 14, emptyL: 10, fuel: "diesel" },
+  { label: "Semi / Artic",   l: 22, emptyL: 15, fuel: "diesel" },
 ];
 
-const FUEL_QUOTE_OPTS = [
-  ...TRACKER_PRODUCTS.map(p => ({ id: p.id, label: `${p.title} · ${p.region}` })),
-  ...FLEET_DIESEL,
+const FUEL_QUOTE_GROUPS = [
+  {
+    label: "DMRE retail — published monthly",
+    options: TRACKER_PRODUCTS.map(p => ({ id: p.id, label: `${p.title} · ${p.region}` })),
+  },
+  {
+    label: "Fleet diesel 50ppm — pump grade",
+    options: FLEET_DIESEL,
+  },
 ];
+
+const FUEL_QUOTE_OPTS = FUEL_QUOTE_GROUPS.flatMap(g => g.options);
+
+const FUEL_LABELS = Object.fromEntries(FUEL_QUOTE_OPTS.map(o => [o.id, o.label]));
+
+function getFuelPrice(fuel, id) {
+  const n = Number(fuel?.[id]);
+  if (Number.isFinite(n)) return n;
+  const fallback = Number(FUEL[id]);
+  return Number.isFinite(fallback) ? fallback : 0;
+}
+
+function fuelLabel(id) {
+  return FUEL_LABELS[id] || id;
+}
+
+function defaultFuelKeyForVehicle(vehicleFuel) {
+  return vehicleFuel === "diesel" ? "d500i" : "p93i";
+}
+
+function dieselFuelHint(fuelKey) {
+  if (fuelKey.startsWith("d500")) {
+    return "DMRE retail diesel (0.05% sulphur) — matches the official fuel price tracker.";
+  }
+  if (fuelKey.startsWith("d50")) {
+    return "Fleet 50ppm pump grade — what many trucks actually pay; usually priced above DMRE 0.05%.";
+  }
+  return null;
+}
+
+// ─── Routing (Nominatim geocoding + OSRM — free, no API key) ─────────────
+const NOMINATIM_BASE = "https://nominatim.openstreetmap.org";
+const OSRM_BASE = "https://router.project-osrm.org";
+const GEO_CACHE_KEY = "lc_geocode_v1";
+
+function readGeocodeCache() {
+  try {
+    const raw = localStorage.getItem(GEO_CACHE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function cacheGeocode(query, result) {
+  try {
+    const cache = readGeocodeCache();
+    cache[query.toLowerCase()] = result;
+    const keys = Object.keys(cache);
+    if (keys.length > 200) {
+      keys.slice(0, keys.length - 200).forEach(k => delete cache[k]);
+    }
+    localStorage.setItem(GEO_CACHE_KEY, JSON.stringify(cache));
+  } catch {}
+}
+
+async function geocodePlace(query) {
+  const q = query.trim();
+  if (!q) return null;
+
+  const cacheKey = q.toLowerCase();
+  const cached = readGeocodeCache()[cacheKey];
+  if (cached) return cached;
+
+  const searchQ = /\bsouth africa\b/i.test(q) ? q : `${q}, South Africa`;
+  const url = `${NOMINATIM_BASE}/search?${new URLSearchParams({
+    q: searchQ,
+    countrycodes: "za",
+    format: "json",
+    limit: "1",
+  })}`;
+
+  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!res.ok) throw new Error("Geocoding service unavailable");
+
+  const data = await res.json();
+  if (!data?.length) return null;
+
+  const hit = data[0];
+  const result = {
+    lat: parseFloat(hit.lat),
+    lon: parseFloat(hit.lon),
+    displayName: hit.display_name,
+  };
+  cacheGeocode(q, result);
+  return result;
+}
+
+async function osrmDrivingRoute(waypoints) {
+  if (waypoints.length < 2) throw new Error("Need at least 2 locations");
+
+  const coords = waypoints.map(w => `${w.lon},${w.lat}`).join(";");
+  const url = `${OSRM_BASE}/route/v1/driving/${coords}?overview=full&geometries=geojson`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("Routing service unavailable");
+
+  const data = await res.json();
+  if (data.code !== "Ok" || !data.routes?.length) {
+    throw new Error("No driving route found between these locations");
+  }
+
+  const route = data.routes[0];
+  const legs = route.legs.map((leg, i) => ({
+    index: i + 1,
+    fromLabel: waypoints[i].label || waypoints[i].displayName?.split(",")[0] || `Stop ${i + 1}`,
+    toLabel: waypoints[i + 1].label || waypoints[i + 1].displayName?.split(",")[0] || `Stop ${i + 2}`,
+    distanceKm: leg.distance / 1000,
+    durationMin: Math.round(leg.duration / 60),
+  }));
+
+  return {
+    distanceKm: route.distance / 1000,
+    durationMin: Math.round(route.duration / 60),
+    geometry: route.geometry,
+    legs,
+    waypoints,
+  };
+}
+
+async function geocodeAll(locationTexts) {
+  const geocoded = [];
+  for (const text of locationTexts) {
+    const trimmed = text.trim();
+    const place = await geocodePlace(trimmed);
+    if (!place) throw new Error(`Could not find “${trimmed}”`);
+    geocoded.push({ ...place, label: trimmed });
+    if (!readGeocodeCache()[trimmed.toLowerCase()]) {
+      await new Promise(r => setTimeout(r, 1100));
+    }
+  }
+  return geocoded;
+}
+
+function splitRouteByZone(geometry) {
+  if (!geometry?.coordinates?.length) return null;
+
+  let inlandKm = 0;
+  let coastalKm = 0;
+  const coords = geometry.coordinates;
+
+  for (let i = 0; i < coords.length - 1; i++) {
+    const segKm = distance(point(coords[i]), point(coords[i + 1]), { units: "kilometers" });
+    const mid = point([
+      (coords[i][0] + coords[i + 1][0]) / 2,
+      (coords[i][1] + coords[i + 1][1]) / 2,
+    ]);
+    if (booleanPointInPolygon(mid, COASTAL_ZONE)) coastalKm += segKm;
+    else inlandKm += segKm;
+  }
+
+  return {
+    inlandKm: Math.round(inlandKm),
+    coastalKm: Math.round(coastalKm),
+    totalKm: Math.round(inlandKm + coastalKm),
+  };
+}
+
+async function calculateRoute(locationTexts) {
+  const texts = locationTexts.map(t => t.trim()).filter(Boolean);
+  if (texts.length < 2) throw new Error("Enter at least a start and end location");
+
+  const waypoints = await geocodeAll(texts);
+  const route = await osrmDrivingRoute(waypoints);
+  const zoneSplit = splitRouteByZone(route.geometry);
+
+  return {
+    ...route,
+    from: waypoints[0],
+    to: waypoints[waypoints.length - 1],
+    zoneSplit,
+  };
+}
+
+function fuelProductBase(fuelKey) {
+  if (fuelKey.endsWith("i") || fuelKey.endsWith("c")) return fuelKey.slice(0, -1);
+  return fuelKey;
+}
+
+function zoneFuelPrices(fuel, fuelKey) {
+  const base = fuelProductBase(fuelKey);
+  const inland = getFuelPrice(fuel, `${base}i`);
+  const hasCoastal = Number.isFinite(Number(fuel?.[`${base}c`]));
+  const coastal = hasCoastal ? getFuelPrice(fuel, `${base}c`) : inland;
+  return { base, inland, coastal, hasCoastal };
+}
+
+function computeTripFuelCost({
+  fuel,
+  fuelKey,
+  loadedL,
+  emptyL,
+  outboundKm,
+  returnKm = 0,
+  returnEmpty = false,
+  zoneSplit = null,
+  useZoneSplit = true,
+}) {
+  const prices = zoneFuelPrices(fuel, fuelKey);
+  const singlePrice = getFuelPrice(fuel, fuelKey);
+
+  const fuelForKm = (km, lPer100) => {
+    if (km <= 0) return 0;
+    if (useZoneSplit && zoneSplit && zoneSplit.inlandKm + zoneSplit.coastalKm > 0) {
+      const ratioInland = zoneSplit.inlandKm / (zoneSplit.inlandKm + zoneSplit.coastalKm);
+      const ratioCoastal = zoneSplit.coastalKm / (zoneSplit.inlandKm + zoneSplit.coastalKm);
+      const iKm = km * ratioInland;
+      const cKm = km * ratioCoastal;
+      return (iKm / 100) * lPer100 * prices.inland + (cKm / 100) * lPer100 * prices.coastal;
+    }
+    return (km / 100) * lPer100 * singlePrice;
+  };
+
+  let fuelCost = fuelForKm(outboundKm, loadedL);
+  if (returnEmpty && returnKm > 0) {
+    fuelCost += fuelForKm(returnKm, emptyL);
+  }
+
+  return { fuelCost, prices, blendedPrice: singlePrice };
+}
+
+function buildRouteLocations(from, stops, to) {
+  return [from, ...stops.map(s => s.trim()).filter(Boolean), to]
+    .map(s => s.trim())
+    .filter(Boolean);
+}
 
 // ─── Styles ───────────────────────────────────────────────────────────────
 const css = `
@@ -222,6 +542,23 @@ const css = `
   /* DIST DISPLAY */
   .dist-val{font-family:'Barlow Condensed',sans-serif;font-size:36px;font-weight:700;color:var(--amber);line-height:1}
   .dist-val span{font-size:16px;color:var(--muted);font-weight:400;margin-left:4px}
+  .dist-mode-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+  .dist-meta{font-size:11px;color:var(--muted);line-height:1.5;margin-top:10px}
+  .dist-meta a{color:var(--amber);text-decoration:none;cursor:pointer}
+  .dist-meta a:hover{text-decoration:underline}
+  .route-loading{color:var(--amber);font-size:12px}
+  .stop-row{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+  .stop-row .input{flex:1}
+  .stop-num{font-size:11px;color:var(--muted);min-width:52px;font-weight:600}
+  .check-row{display:flex;align-items:center;gap:10px;font-size:13px;cursor:pointer;margin-bottom:12px;color:var(--white)}
+  .check-row input{width:16px;height:16px;accent-color:var(--amber);cursor:pointer}
+  .leg-list{margin-top:12px;border-top:1px solid var(--border);padding-top:12px}
+  .leg-item{font-size:12px;color:var(--muted);padding:7px 0;border-bottom:1px solid rgba(36,52,71,.35)}
+  .leg-item:last-child{border-bottom:none}
+  .leg-item strong{color:var(--white);font-weight:600}
+  .zone-split{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .zone-pill{font-size:11px;padding:4px 10px;border-radius:100px;background:var(--card2);border:1px solid var(--border);color:var(--muted)}
+  .zone-pill em{font-style:normal;color:var(--amber);font-weight:600}
   /* MODAL */
   .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:20px}
   .modal{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:28px;width:100%;max-width:480px;max-height:90vh;overflow-y:auto}
@@ -263,25 +600,33 @@ export default function LogiCostApp() {
   const [toast, setToast]       = useState(null);
   const [modal, setModal]       = useState(null); // { type, data }
   const [fuel, setFuel]         = useState(FUEL);
+  const [dataSource, setDataSource] = useState("loading");
 
-  // Load from storage
+  // Load from API or localStorage
   useEffect(() => {
     (async () => {
-      const c = await store.get("lc_clients"); if (c) setClients(c);
-      const q = await store.get("lc_quotes");  if (q) setQuotes(q);
-      const p = await store.get("lc_profile"); if (p) setProfile(p);
+      await initDataStore();
+      const data = await loadAppData();
+      setClients(data.clients);
+      setQuotes(data.quotes);
+      setProfile(data.profile);
+      setDataSource(useBackend ? "api" : "local");
+      if (data.migrated) {
+        setToast("Local data migrated to server ✓");
+        setTimeout(() => setToast(null), 3000);
+      }
     })();
     fetch(`${API_BASE}/v1/prices/latest`)
       .then(r => r.json())
       .then(j => {
-        if (j.success && j.data) setFuel(fuelFromApiEntry(j.data));
+        if (j.success && j.data) setFuel({ ...FUEL, ...fuelFromApiEntry(j.data) });
       })
       .catch(() => {});
   }, []);
 
-  const saveClients = async c => { setClients(c); await store.set("lc_clients", c); };
-  const saveQuotes  = async q => { setQuotes(q);  await store.set("lc_quotes", q);  };
-  const saveProfile = async p => { setProfile(p); await store.set("lc_profile", p); };
+  const saveClients = async c => { setClients(c); await persistClients(c); };
+  const saveQuotes  = async q => { setQuotes(q);  await persistQuotes(q);  };
+  const saveProfile = async p => { setProfile(p); await persistProfile(p); };
 
   const showToast = msg => {
     setToast(msg);
@@ -335,12 +680,17 @@ export default function LogiCostApp() {
               <span className="nav-icon">{n.icon}</span> {n.label}
             </div>
           ))}
+          <div style={{ marginTop: "auto", padding: "12px 20px", borderTop: "1px solid var(--border)" }}>
+            <div style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", letterSpacing: ".8px" }}>
+              Data · {dataSource === "api" ? "Server" : dataSource === "local" ? "Browser" : "…"}
+            </div>
+          </div>
           {page !== "dashboard" && (
             <div className="sidebar-fuel">
               <div className="fuel-badge">DMRE · {fuel.month}</div>
               {TRACKER_PRODUCTS.filter(p => ["p95i", "p93i", "d500i"].includes(p.id)).map(p => (
                 <div key={p.id} className="fuel-row">
-                  {p.chart} <span>{`R${fuel[p.id].toFixed(2)}`}</span>
+                  {p.chart} <span>{R(getFuelPrice(fuel, p.id))}</span>
                 </div>
               ))}
             </div>
@@ -353,7 +703,7 @@ export default function LogiCostApp() {
           {page === "newquote"  && <NewQuote  clients={clients} fuel={fuel} addQuote={addQuote} profile={profile} showToast={showToast} />}
           {page === "quotes"    && <QuotesList quotes={quotes} clients={clients} updateStatus={updateQuoteStatus} deleteQuote={deleteQuote} profile={profile} fuel={fuel} showToast={showToast} />}
           {page === "clients"   && <ClientsList clients={clients} quotes={quotes} addClient={addClient} deleteClient={deleteClient} setModal={setModal} />}
-          {page === "settings"  && <Settings profile={profile} saveProfile={saveProfile} showToast={showToast} />}
+          {page === "settings"  && <Settings profile={profile} saveProfile={saveProfile} showToast={showToast} dataSource={dataSource} />}
         </main>
 
         {/* BOTTOM NAV MOBILE */}
@@ -469,7 +819,7 @@ function FuelPrices({ fuel }) {
           <div key={p.id} className="tracker-card" style={{ borderColor: `${p.color}44` }}>
             <div className="tracker-card-type">{p.title}</div>
             <div className="tracker-card-region">{p.region}</div>
-            <div className="tracker-card-price" style={{ color: p.color }}>{R(fuel[p.id])}</div>
+            <div className="tracker-card-price" style={{ color: p.color }}>{R(getFuelPrice(fuel, p.id))}</div>
             <div className="tracker-card-unit">
               {p.id.startsWith("d500")
                 ? "per litre · 0.05% sulphur"
@@ -675,8 +1025,16 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
   const [clientId, setClientId] = useState("");
   const [clientName, setClientName] = useState("");
   const [from, setFrom]         = useState("");
+  const [stops, setStops]       = useState([]);
   const [to, setTo]             = useState("");
-  const [dist, setDist]         = useState(100);
+  const [manualDist, setManualDist] = useState(100);
+  const [routedKm, setRoutedKm] = useState(null);
+  const [distMode, setDistMode] = useState("manual");
+  const [routeStatus, setRouteStatus] = useState("idle");
+  const [routeError, setRouteError] = useState("");
+  const [routeInfo, setRouteInfo] = useState(null);
+  const [returnEmpty, setReturnEmpty] = useState(false);
+  const [emptyL, setEmptyL]     = useState(null);
   const [veh, setVeh]           = useState(0);
   const [fuelKey, setFuelKey]   = useState("p93i");
   const [tolls, setTolls]       = useState(0);
@@ -686,16 +1044,120 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
   const [notes, setNotes]       = useState("");
   const [preview, setPreview]   = useState(false);
 
-  const vehicle    = VEHICLES[veh];
-  const fuelPrice  = fuel[fuelKey] || fuel.p93i;
-  const fuelCost   = (dist / 100) * vehicle.l * fuelPrice;
+  const routeRequestRef = useRef(0);
+  const manualOverrideRef = useRef(false);
+
+  const vehicle = VEHICLES[veh];
+  const loadedL = vehicle.l;
+  const effectiveEmptyL = emptyL ?? vehicle.emptyL;
+
+  const outboundKm = distMode === "auto" && routedKm != null ? routedKm : manualDist;
+  const returnKm = returnEmpty ? outboundKm : 0;
+  const dist = outboundKm + returnKm;
+
+  const routeLocations = useMemo(
+    () => buildRouteLocations(from, stops, to),
+    [from, stops, to]
+  );
+
+  const runRouteCalculation = async (reqId, locations) => {
+    setRouteStatus("loading");
+    setRouteError("");
+    try {
+      const result = await calculateRoute(locations);
+      if (reqId !== routeRequestRef.current) return null;
+
+      const km = Math.max(5, Math.round(result.distanceKm));
+      setRoutedKm(km);
+      setRouteInfo({
+        durationMin: result.durationMin,
+        fromLabel: result.from.displayName,
+        toLabel: result.to.displayName,
+        legs: result.legs,
+        zoneSplit: result.zoneSplit,
+      });
+      setRouteStatus("ok");
+      if (!manualOverrideRef.current) setDistMode("auto");
+      return km;
+    } catch (err) {
+      if (reqId !== routeRequestRef.current) return null;
+      setRouteStatus("error");
+      setRouteError(err.message || "Could not calculate route");
+      return null;
+    }
+  };
+
+  useEffect(() => {
+    manualOverrideRef.current = false;
+    setRoutedKm(null);
+    setRouteInfo(null);
+    setRouteError("");
+    setRouteStatus("idle");
+
+    if (routeLocations.length < 2) return;
+
+    const reqId = ++routeRequestRef.current;
+    const timer = setTimeout(() => runRouteCalculation(reqId, routeLocations), 900);
+    return () => clearTimeout(timer);
+  }, [routeLocations.join("|")]);
+
+  const applyRouteDistance = () => {
+    if (routedKm == null) return;
+    manualOverrideRef.current = false;
+    setDistMode("auto");
+    showToast(`Route distance applied · ${routedKm} km`);
+  };
+
+  const recalculateRoute = async () => {
+    if (routeLocations.length < 2) {
+      showToast("Enter From and To locations first");
+      return;
+    }
+    const reqId = ++routeRequestRef.current;
+    manualOverrideRef.current = false;
+    const km = await runRouteCalculation(reqId, routeLocations);
+    if (km != null) showToast(`Route calculated · ${km} km`);
+  };
+
+  const handleSliderChange = value => {
+    manualOverrideRef.current = true;
+    setDistMode("manual");
+    setManualDist(value);
+  };
+
+  const addStop = () => setStops(prev => [...prev, ""]);
+  const updateStop = (i, val) => setStops(prev => prev.map((s, idx) => idx === i ? val : s));
+  const removeStop = i => setStops(prev => prev.filter((_, idx) => idx !== i));
+
+  const zoneSplit = routeInfo?.zoneSplit;
+  const useZoneSplit = distMode === "auto" && routeStatus === "ok" && zoneSplit != null;
+  const zonePrices = zoneFuelPrices(fuel, fuelKey);
+
+  const { fuelCost } = computeTripFuelCost({
+    fuel,
+    fuelKey,
+    loadedL,
+    emptyL: effectiveEmptyL,
+    outboundKm,
+    returnKm,
+    returnEmpty,
+    zoneSplit,
+    useZoneSplit,
+  });
+
   const driverCost = (dist / avgSpeed) * driverRate;
   const subtotal   = fuelCost + tolls + driverCost;
   const total      = subtotal * (1 + margin / 100);
-  const num        = "PREVIEW";
+  const dieselHint = dieselFuelHint(fuelKey);
+  const displayFuelPrice = useZoneSplit
+    ? `${R(zonePrices.inland)}/L inland · ${R(zonePrices.coastal)}/L coastal`
+    : `${R(getFuelPrice(fuel, fuelKey))}/L`;
 
   const selectedClient = clients.find(c => c.id === clientId);
   const displayName    = selectedClient?.name || clientName || "Client Name";
+  const routeLabel     = routeLocations.length > 2
+    ? routeLocations.join(" → ")
+    : `${from} → ${to}`;
 
   const handleClientSelect = e => {
     const id = e.target.value;
@@ -706,29 +1168,54 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
 
   const handleSave = () => {
     if (!displayName || displayName === "Client Name") { showToast("Add a client name first"); return; }
-    addQuote({ clientId, clientName: displayName, from, to, dist, vehicle: vehicle.label,
-      fuelKey, fuelPrice, fuelCost, driverCost, tolls, subtotal, margin, total, notes });
+    addQuote({
+      clientId, clientName: displayName, from, to, stops: stops.filter(s => s.trim()),
+      dist, outboundKm, returnKm, returnEmpty, emptyL: effectiveEmptyL, distMode, routedKm,
+      routeInfo: routeInfo ? { legs: routeInfo.legs, zoneSplit: routeInfo.zoneSplit } : null,
+      vehicle: vehicle.label, fuelKey,
+      fuelPrice: getFuelPrice(fuel, fuelKey), zoneSplit: useZoneSplit ? zoneSplit : null,
+      fuelCost, driverCost, tolls, subtotal, margin, total, notes,
+    });
   };
 
   const handleWhatsApp = () => {
+    const legsNote = routeInfo?.legs?.length > 1
+      ? `\nLegs: ${routeInfo.legs.map(l => `${l.fromLabel}→${l.toLabel} (${Math.round(l.distanceKm)}km)`).join(", ")}`
+      : "";
+    const zoneNote = useZoneSplit
+      ? `\nZone split: ${zoneSplit.inlandKm}km inland @ ${R(zonePrices.inland)}/L · ${zoneSplit.coastalKm}km coastal @ ${R(zonePrices.coastal)}/L`
+      : "";
+    const returnNote = returnEmpty ? `\nReturn empty: ${returnKm}km @ ${effectiveEmptyL}L/100km` : "";
+    const distNote = distMode === "auto" ? `${dist}km (OSRM)` : `${dist}km (manual)`;
     const msg = encodeURIComponent(
-      `*LOGICOST QUOTE*\n\nClient: ${displayName}\nRoute: ${from} → ${to} (${dist}km)\n\nFuel: ${R(fuelCost)}\nDriver: ${R(driverCost)}\nTolls: ${R(tolls)}\nMargin: ${margin}%\n\n*TOTAL: ${R(total)}*\n\nGenerated via LogiCost`
+      `*LOGICOST QUOTE*\n\nClient: ${displayName}\nRoute: ${routeLabel} (${distNote})${legsNote}${zoneNote}${returnNote}\n\nFuel: ${R(fuelCost)}\nDriver: ${R(driverCost)}\nTolls: ${R(tolls)}\nMargin: ${margin}%\n\n*TOTAL: ${R(total)}*\n\nGenerated via LogiCost`
     );
     window.open(`https://wa.me/?text=${msg}`, "_blank");
+  };
+
+  const sliderValue = distMode === "auto" && routedKm != null ? routedKm : manualDist;
+
+  const previewQuote = {
+    number: "00001",
+    clientName: displayName,
+    from, to, stops: stops.filter(s => s.trim()), dist, outboundKm, returnKm, returnEmpty,
+    distMode, routeInfo, zoneSplit: useZoneSplit ? zoneSplit : null,
+    vehicle: vehicle.label, fuelKey, fuelPrice: getFuelPrice(fuel, fuelKey),
+    fuelCost, driverCost, tolls, margin, total, subtotal, notes, createdAt: today(),
   };
 
   return (
     <>
       <div className="page-header">
         <div className="page-title">New Quote</div>
-        <div className="page-sub">Fill in the trip details to generate a quote</div>
+        <div className="page-sub">Multi-stop routing · inland/coastal fuel split · return-empty costing</div>
       </div>
 
       <div style={{display:"grid",gridTemplateColumns:"1fr 340px",gap:16,alignItems:"start"}}>
         <div>
-          {/* CLIENT */}
+          {/* CLIENT & ROUTE */}
           <div className="card">
-            <div className="card-title">Client</div>
+            <div className="card-title">Route</div>
             <div className="field">
               <label className="label">Select Saved Client</label>
               <select className="input select" value={clientId} onChange={handleClientSelect}>
@@ -742,16 +1229,22 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
                 <input className="input" value={clientName} onChange={e => setClientName(e.target.value)} placeholder="ABC Furniture" />
               </div>
             )}
-            <div className="grid2">
-              <div className="field">
-                <label className="label">From</label>
-                <input className="input" value={from} onChange={e => setFrom(e.target.value)} placeholder="Johannesburg" />
-              </div>
-              <div className="field">
-                <label className="label">To</label>
-                <input className="input" value={to} onChange={e => setTo(e.target.value)} placeholder="Pretoria" />
-              </div>
+            <div className="field">
+              <label className="label">From</label>
+              <input className="input" value={from} onChange={e => setFrom(e.target.value)} placeholder="Johannesburg" />
             </div>
+            {stops.map((stop, i) => (
+              <div key={i} className="stop-row">
+                <span className="stop-num">Stop {i + 1}</span>
+                <input className="input" value={stop} onChange={e => updateStop(i, e.target.value)} placeholder="Bloemfontein" />
+                <button type="button" className="btn btn-red btn-sm" onClick={() => removeStop(i)} aria-label="Remove stop">✕</button>
+              </div>
+            ))}
+            <div className="field">
+              <label className="label">To</label>
+              <input className="input" value={to} onChange={e => setTo(e.target.value)} placeholder="Cape Town" />
+            </div>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={addStop}>+ Add stop</button>
           </div>
 
           {/* VEHICLE */}
@@ -759,27 +1252,136 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
             <div className="card-title">Vehicle & Fuel</div>
             <div className="v-grid" style={{marginBottom:14}}>
               {VEHICLES.map((v, i) => (
-                <button key={i} className={`v-btn ${veh===i?"active":""}`} onClick={() => { setVeh(i); setFuelKey(v.fuel === "d50" ? "d50i" : "p93i"); }}>
+                <button key={i} type="button" className={`v-btn ${veh===i?"active":""}`} onClick={() => {
+                  setVeh(i);
+                  setFuelKey(defaultFuelKeyForVehicle(v.fuel));
+                  setEmptyL(null);
+                }}>
                   <span className="v-name">{v.label}</span>
-                  <span className="v-stat">~{v.l}L/100km</span>
+                  <span className="v-stat">{v.l}L loaded · {v.emptyL}L empty</span>
                 </button>
               ))}
             </div>
+            <label className="check-row">
+              <input type="checkbox" checked={returnEmpty} onChange={e => setReturnEmpty(e.target.checked)} />
+              Return empty — add return leg at lower consumption
+            </label>
+            {returnEmpty && (
+              <div className="field">
+                <label className="label">Empty consumption (L/100km)</label>
+                <input type="number" className="input" value={effectiveEmptyL} min={1} max={40}
+                  onChange={e => setEmptyL(+e.target.value)} />
+              </div>
+            )}
             <div className="field">
               <label className="label">Fuel Type</label>
               <select className="input select" value={fuelKey} onChange={e => setFuelKey(e.target.value)}>
-                {FUEL_QUOTE_OPTS.map(o => <option key={o.id} value={o.id}>{o.label} — {R(fuel[o.id])}/L</option>)}
+                {FUEL_QUOTE_GROUPS.map(group => (
+                  <optgroup key={group.label} label={group.label}>
+                    {group.options.map(o => (
+                      <option key={o.id} value={o.id}>
+                        {o.label} — {R(getFuelPrice(fuel, o.id))}/L
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
               </select>
+              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>
+                {useZoneSplit
+                  ? `Auto zone split · ${displayFuelPrice} · ${fuel.month} DMRE`
+                  : `Selected: ${fuelLabel(fuelKey)} @ ${displayFuelPrice} · ${fuel.month} DMRE`}
+              </div>
+              {dieselHint && (
+                <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4, lineHeight: 1.45 }}>
+                  {dieselHint}
+                </div>
+              )}
             </div>
           </div>
 
           {/* DISTANCE */}
           <div className="card">
-            <div className="card-title">Distance</div>
-            <div className="dist-val">{dist}<span>km</span></div>
-            <input type="range" className="slider" min={10} max={1500} step={5} value={dist} onChange={e => setDist(+e.target.value)} />
-            <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:"var(--muted)",marginTop:4}}>
+            <div className="dist-mode-row">
+              <div className="card-title" style={{ margin: 0 }}>Distance</div>
+              {distMode === "auto" && routeStatus === "ok" ? (
+                <span className="badge badge-green">OSRM route</span>
+              ) : (
+                <span className="badge badge-amber">Manual override</span>
+              )}
+            </div>
+            <div className="dist-val">
+              {routeStatus === "loading" ? "…" : dist}
+              <span>km</span>
+            </div>
+            {returnEmpty && routeStatus !== "loading" && (
+              <div className="dist-meta">
+                Outbound {outboundKm} km (loaded {loadedL}L/100) + return {returnKm} km (empty {effectiveEmptyL}L/100)
+              </div>
+            )}
+            {routeStatus === "loading" && (
+              <div className="route-loading">Calculating route via OpenStreetMap…</div>
+            )}
+            {routeStatus === "ok" && routeInfo && distMode === "auto" && (
+              <div className="dist-meta">
+                ~{routeInfo.durationMin} min driving{returnEmpty ? " one-way" : ""} · road distance via OSRM
+              </div>
+            )}
+            {routeStatus === "ok" && routedKm != null && distMode === "manual" && (
+              <div className="dist-meta">
+                Route suggests {routedKm} km
+                {" · "}
+                <a role="button" tabIndex={0} onClick={applyRouteDistance} onKeyDown={e => e.key === "Enter" && applyRouteDistance()}>
+                  Use route distance
+                </a>
+              </div>
+            )}
+            {routeStatus === "error" && (
+              <div className="dist-meta" style={{ color: "var(--red)" }}>
+                {routeError}
+                {" · "}
+                <a role="button" tabIndex={0} onClick={recalculateRoute} onKeyDown={e => e.key === "Enter" && recalculateRoute()}>
+                  Retry
+                </a>
+                {" · use slider below"}
+              </div>
+            )}
+            {routeStatus === "ok" && routeInfo?.legs?.length > 1 && (
+              <div className="leg-list">
+                {routeInfo.legs.map(leg => (
+                  <div key={leg.index} className="leg-item">
+                    Leg {leg.index}: <strong>{leg.fromLabel}</strong> → <strong>{leg.toLabel}</strong>
+                    {" · "}{Math.round(leg.distanceKm)} km · ~{leg.durationMin} min
+                  </div>
+                ))}
+              </div>
+            )}
+            {useZoneSplit && zoneSplit && (
+              <div className="zone-split">
+                <span className="zone-pill"><em>{zoneSplit.inlandKm} km</em> inland @ {R(zonePrices.inland)}/L</span>
+                <span className="zone-pill"><em>{zoneSplit.coastalKm} km</em> coastal @ {R(zonePrices.coastal)}/L</span>
+              </div>
+            )}
+            {useZoneSplit && (
+              <div className="dist-meta" style={{ marginTop: 8 }}>
+                Zone split is approximate — not official DMRE depot boundaries
+              </div>
+            )}
+            <input
+              type="range"
+              className="slider"
+              min={10}
+              max={1500}
+              step={5}
+              value={sliderValue}
+              onChange={e => handleSliderChange(+e.target.value)}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
               <span>10 km</span><span>750 km</span><span>1 500 km</span>
+            </div>
+            <div className="btn-row" style={{ marginTop: 12, marginBottom: 0 }}>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={recalculateRoute} disabled={routeStatus === "loading"}>
+                {routeStatus === "loading" ? "Calculating…" : "Recalculate route"}
+              </button>
             </div>
           </div>
 
@@ -802,7 +1404,11 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
             <div className="meter">
               <div style={{fontSize:11,color:"var(--muted)",textTransform:"uppercase",letterSpacing:".8px",marginBottom:6}}>Suggested Quote</div>
               <div className="meter-val">{R(total)}</div>
-              <div className="meter-label">{dist}km · {vehicle.label}</div>
+              <div className="meter-label">
+                {dist}km · {vehicle.label} · {displayFuelPrice}
+                {distMode === "auto" && routeStatus === "ok" ? " · OSRM" : ""}
+                {returnEmpty ? " · return empty" : ""}
+              </div>
             </div>
             <hr className="divider" />
             <div style={{fontSize:13}}>
@@ -830,8 +1436,7 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
               <span style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:18,fontWeight:700}}>Quote Preview</span>
               <button className="btn btn-ghost btn-sm" onClick={() => setPreview(false)}>✕ Close</button>
             </div>
-            <QuotePDF q={{number:"00001",clientName:displayName,from,to,dist,vehicle:vehicle.label,
-              fuelCost,driverCost,tolls,margin,total,subtotal,notes,createdAt:today()}} profile={profile} fuelMonth={fuel.month} />
+            <QuotePDF q={previewQuote} profile={profile} fuelMonth={fuel.month} zonePrices={zonePrices} />
             <div className="btn-row" style={{marginTop:16}}>
               <button className="btn btn-green" style={{flex:1,justifyContent:"center"}} onClick={handleWhatsApp}>Send via WhatsApp</button>
             </div>
@@ -843,7 +1448,11 @@ function NewQuote({ clients, fuel, addQuote, profile, showToast }) {
 }
 
 // ─── QUOTE PDF TEMPLATE ───────────────────────────────────────────────────
-function QuotePDF({ q, profile, fuelMonth }) {
+function QuotePDF({ q, profile, fuelMonth, zonePrices }) {
+  const routeDisplay = q.stops?.length
+    ? [q.from, ...q.stops, q.to].filter(Boolean).join(" → ")
+    : `${q.from} → ${q.to}`;
+
   return (
     <div className="quote-preview">
       <div className="qp-header">
@@ -867,9 +1476,43 @@ function QuotePDF({ q, profile, fuelMonth }) {
 
       <div className="qp-section">
         <h4>Trip Details</h4>
-        <div className="qp-row"><span>Route</span><span>{q.from} → {q.to}</span></div>
-        <div className="qp-row"><span>Distance</span><span>{q.dist} km</span></div>
+        <div className="qp-row"><span>Route</span><span>{routeDisplay}</span></div>
+        <div className="qp-row">
+          <span>Distance</span>
+          <span>
+            {q.dist} km{q.distMode === "auto" ? " (OSRM)" : ""}
+            {q.returnEmpty ? " · incl. return empty" : ""}
+          </span>
+        </div>
+        {q.returnEmpty && (
+          <div className="qp-row">
+            <span>Legs</span>
+            <span>{q.outboundKm} km loaded + {q.returnKm} km empty</span>
+          </div>
+        )}
+        {q.routeInfo?.legs?.length > 1 && q.routeInfo.legs.map(leg => (
+          <div key={leg.index} className="qp-row">
+            <span>Leg {leg.index}</span>
+            <span>{leg.fromLabel} → {leg.toLabel} · {Math.round(leg.distanceKm)} km</span>
+          </div>
+        ))}
         <div className="qp-row"><span>Vehicle</span><span>{q.vehicle}</span></div>
+        {q.fuelKey && (
+          <div className="qp-row">
+            <span>Fuel</span>
+            <span>
+              {q.zoneSplit && zonePrices
+                ? `${fuelLabel(q.fuelKey)} · ${R(zonePrices.inland)}/L inland · ${R(zonePrices.coastal)}/L coastal`
+                : `${fuelLabel(q.fuelKey)} @ ${R(q.fuelPrice)}/L`}
+            </span>
+          </div>
+        )}
+        {q.zoneSplit && (
+          <div className="qp-row">
+            <span>Zone split</span>
+            <span>{q.zoneSplit.inlandKm} km inland · {q.zoneSplit.coastalKm} km coastal (approx.)</span>
+          </div>
+        )}
       </div>
 
       <div className="qp-section">
@@ -955,7 +1598,8 @@ function QuotesList({ quotes, clients, updateStatus, deleteQuote, profile, fuel,
               <span style={{fontFamily:"'Barlow Condensed',sans-serif",fontSize:18,fontWeight:700}}>Quote #{selected.number}</span>
               <button className="btn btn-ghost btn-sm" onClick={() => setSelected(null)}>✕</button>
             </div>
-            <QuotePDF q={selected} profile={profile} fuelMonth={fuel.month} />
+            <QuotePDF q={selected} profile={profile} fuelMonth={fuel.month}
+              zonePrices={selected.zoneSplit ? zoneFuelPrices(fuel, selected.fuelKey) : null} />
             <div className="btn-row" style={{marginTop:16}}>
               <button className="btn btn-green" style={{flex:1,justifyContent:"center"}} onClick={() => handleWhatsApp(selected)}>Send via WhatsApp</button>
             </div>
@@ -1036,8 +1680,10 @@ function ClientsList({ clients, quotes, addClient, deleteClient, setModal }) {
 }
 
 // ─── SETTINGS ─────────────────────────────────────────────────────────────
-function Settings({ profile, saveProfile, showToast }) {
+function Settings({ profile, saveProfile, showToast, dataSource }) {
   const [form, setForm] = useState(profile);
+
+  useEffect(() => { setForm(profile); }, [profile]);
 
   const handleSave = () => {
     saveProfile(form);
@@ -1049,6 +1695,18 @@ function Settings({ profile, saveProfile, showToast }) {
       <div className="page-header">
         <div className="page-title">Settings</div>
         <div className="page-sub">Your business profile appears on all quotes</div>
+      </div>
+      <div className="card">
+        <div className="card-title">Data Storage</div>
+        <div style={{ fontSize: 13, color: "var(--muted)", lineHeight: 1.7 }}>
+          {dataSource === "api" ? (
+            <>Clients, quotes, and profile are saved to the <strong style={{ color: "var(--green)" }}>LogiCost API</strong> (SQLite).</>
+          ) : dataSource === "local" ? (
+            <>API unavailable — data is stored in <strong style={{ color: "var(--amber)" }}>browser localStorage</strong>. Run <code style={{ color: "var(--white)" }}>npm run dev</code> to start the server.</>
+          ) : (
+            <>Checking storage…</>
+          )}
+        </div>
       </div>
       <div className="card">
         <div className="card-title">Business Profile</div>
